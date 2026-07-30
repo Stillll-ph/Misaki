@@ -1,0 +1,10 @@
+# Misaki (dust_removal_gui.py). Tkinter ships with Python itself.
+numpy
+scipy
+scikit-image
+pillow
+tifffile
+
+# Tests: pytest test_parity.py -q
+pytest
+hypothesis
