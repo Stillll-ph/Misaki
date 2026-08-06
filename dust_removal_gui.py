@@ -42,6 +42,10 @@ from scipy.ndimage import (binary_fill_holes, convolve, distance_transform_edt,
                            find_objects, label, uniform_filter)
 
 APP_TITLE = "Misaki"
+# Bumped per release. Shown in the footer while no scan is open, which is the
+# one place it can sit without competing with the file information that
+# replaces it - and it is what identifies a copied exe once releases exist.
+APP_VERSION = "1.0.0"
 
 DEFAULTS = {
     "window": 256,
@@ -1924,7 +1928,9 @@ class DustRemovalApp(tk.Tk):
         self.status = ttk.Label(footer, text="Open a scan to begin.",
                                 style="Status.TLabel", anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
-        self.file_label = ttk.Label(footer, text="No image loaded",
+        self.file_label = ttk.Label(footer,
+                                    text="Misaki %s - no image loaded"
+                                    % APP_VERSION,
                                     style="Status.TLabel", anchor="e")
         self.file_label.pack(side="right")
 
