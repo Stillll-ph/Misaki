@@ -235,6 +235,24 @@ OPEN_TYPES = [
     ("TIFF", "*.tif *.tiff"),
     ("All files", "*.*"),
 ]
+QUEUE_EXTS = tuple(p.lstrip("*") for p in OPEN_TYPES[0][1].split())
+
+
+def queue_from_folder(folder):
+    """
+    The scans in a folder, in name order, to work through one after another.
+
+    This app's own outputs are left out. A folder that has been half worked
+    through holds a `_dustfree` file beside each finished scan, and queueing
+    those would put every finished frame back in front of you as if it were
+    new - and saving it again would write `_dustfree_dustfree`.
+    """
+    out = []
+    for name in sorted(os.listdir(folder), key=str.lower):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() in QUEUE_EXTS and not stem.lower().endswith("_dustfree"):
+            out.append(os.path.join(folder, name))
+    return out
 
 
 # Keyboard shortcuts, in the order the settings window lists them: an internal
@@ -244,6 +262,10 @@ OPEN_TYPES = [
 # find or change.
 KEY_ACTIONS = (
     ("open", "Open image", "<Control-o>"),
+    ("open_folder", "Open folder", "<Control-Shift-O>"),
+    ("queue_prev", "Previous scan", "<Control-Left>"),
+    ("queue_next", "Next scan", "<Control-Right>"),
+    ("queue_skip", "Skip scan", "<Control-Shift-Right>"),
     ("render", "Final render", "<Control-r>"),
     ("save", "Save result", "<Control-s>"),
     ("delete_mark", "Delete selected mask", "<Control-z>"),
@@ -1529,6 +1551,11 @@ class DustRemovalApp(tk.Tk):
 
         self.image = None           # full grayscale uint8/uint16 image
         self.path = None
+        self.queue = []             # scans to work through, from Open folder
+        self.queue_pos = -1
+        # What the last save wrote, so Next can tell finished from unfinished.
+        self._saved_seq = None
+        self._saved_sig = None
         self.source_meta = {}       # layout of the file we loaded
         self.result = None          # (original, cleaned, mask, idle, protect)
         self.result_origin = None   # (y, x, h, w) the result was taken from
@@ -1855,11 +1882,30 @@ class DustRemovalApp(tk.Tk):
         bar.grid(row=0, column=0, sticky="ew")
         self.open_btn = ttk.Button(bar, text="Open image...", command=self.open_image)
         self.open_btn.pack(side="left")
+        self.folder_btn = ttk.Button(bar, text="Open folder...",
+                                     command=self.open_folder)
+        self.folder_btn.pack(side="left", padx=(6, 0))
         self.render_btn = ttk.Button(bar, text="Final render",
                                      command=self.render_full)
         self.render_btn.pack(side="left", padx=(6, 0))
         self.save_btn = ttk.Button(bar, text="Save result...", command=self.save_image)
         self.save_btn.pack(side="left", padx=(6, 0))
+
+        # The queue's own strip, shown only while a folder is open. Next stays
+        # greyed while the current scan has work that was never saved; Skip is
+        # the deliberate way past it, so nothing is discarded by reflex.
+        self.queue_bar = ttk.Frame(bar)
+        self.queue_label = ttk.Label(self.queue_bar, text="", font=FONT_BOLD)
+        self.queue_label.pack(side="left", padx=(0, 8))
+        self.queue_prev = ttk.Button(self.queue_bar, text="Previous",
+                                     command=lambda: self.queue_step(-1))
+        self.queue_prev.pack(side="left")
+        self.queue_skip = ttk.Button(self.queue_bar, text="Skip",
+                                     command=lambda: self.queue_step(1, skip=True))
+        self.queue_skip.pack(side="left", padx=(6, 0))
+        self.queue_next = ttk.Button(self.queue_bar, text="Next",
+                                     command=lambda: self.queue_step(1))
+        self.queue_next.pack(side="left", padx=(6, 0))
 
         # The margin left of the previews is the same as the one between them
         # and the sidebar, which is the sidebar's own left padding.
@@ -3175,6 +3221,8 @@ class DustRemovalApp(tk.Tk):
                                     or (self.protect_mask is not None
                                         and self.protect_mask.any())))
             else "disabled")
+        # Marks are half of what decides whether Next is allowed.
+        self._refresh_queue_state()
 
     def _on_hover(self, event):
         if self.tool_var.get() == "off":
@@ -3318,7 +3366,76 @@ class DustRemovalApp(tk.Tk):
             return
         path = filedialog.askopenfilename(title="Open scan", filetypes=OPEN_TYPES)
         if path:
+            self.queue, self.queue_pos = [], -1
             self.load_path(path)
+
+    def open_folder(self):
+        if self._saving:
+            return
+        folder = filedialog.askdirectory(title="Open a folder of scans")
+        if folder:
+            self._queue_folder(folder)
+
+    def _queue_folder(self, folder):
+        paths = queue_from_folder(folder)
+        if not paths:
+            messagebox.showinfo("Nothing to open",
+                                "No scans found in %s." % folder)
+            return
+        self.queue, self.queue_pos = paths, -1
+        self._queue_go(0)
+
+    def _queue_go(self, pos):
+        target = self.queue[pos]
+        self.load_path(target)
+        if self.path == target:         # load_path reports failure itself
+            self.queue_pos = pos
+        self._refresh_queue_state()
+
+    def _unsaved(self):
+        """
+        Whether moving on would discard something.
+
+        Work is a mark drawn or a render held. It counts as saved only while
+        the marks are the ones that were saved and the render, if there is
+        one, is the render that was written - so a mark added or a render
+        redone after the save makes the scan unfinished again.
+        """
+        if not self.marks and self.render is None:
+            return False
+        if self._edit_seq != self._saved_seq:
+            return True
+        return self.render is not None and self.render_sig != self._saved_sig
+
+    def queue_step(self, delta, skip=False):
+        if not self.queue or self._saving or self._rendering:
+            return
+        pos = self.queue_pos + delta
+        if not 0 <= pos < len(self.queue):
+            return
+        # Reachable by keyboard while the button is greyed.
+        if not skip and self._unsaved():
+            return
+        self._queue_go(pos)
+
+    def _refresh_queue_state(self):
+        if not hasattr(self, "queue_bar"):
+            return
+        if not self.queue:
+            self.queue_bar.pack_forget()
+            return
+        self.queue_bar.pack(side="right")
+        self.queue_label.config(
+            text="%d of %d" % (self.queue_pos + 1, len(self.queue)))
+        busy = self.image is None or self._saving or self._rendering
+        held = self._unsaved()
+        first = self.queue_pos <= 0
+        last = self.queue_pos >= len(self.queue) - 1
+        self.queue_prev.config(
+            state="disabled" if busy or held or first else "normal")
+        self.queue_skip.config(state="disabled" if busy or last else "normal")
+        self.queue_next.config(
+            state="disabled" if busy or held or last else "normal")
 
     def load_path(self, path):
         """Load a scan from disk and show the first preview."""
@@ -3352,6 +3469,8 @@ class DustRemovalApp(tk.Tk):
         self.render_mask = None
         self.render_idle = None
         self.render_sig = None
+        self._saved_seq = None
+        self._saved_sig = None
         self.h_var.set(0.5)
         self.w_var.set(0.5)
 
@@ -3407,15 +3526,27 @@ class DustRemovalApp(tk.Tk):
         if not deep:
             types = [("JPEG", "*.jpg"), ("PNG", "*.png"), ("TIFF", "*.tif")]
 
-        path = filedialog.asksaveasfilename(
-            title="Save cleaned scan",
-            initialdir=folder,
-            initialfile="%s_dustfree%s" % (stem, ext),
-            defaultextension=ext,
-            filetypes=types,
-        )
-        if not path:
-            return
+        if self.queue:
+            # The dialog is the one-by-one cost a queue exists to remove: every
+            # scan wants the name the dialog would have offered anyway, beside
+            # its source. Its one job that still matters - asking before a
+            # file is replaced - is kept.
+            path = os.path.join(folder, "%s_dustfree%s" % (stem, ext))
+            if os.path.exists(path) and not messagebox.askyesno(
+                    "Replace file?",
+                    "%s already exists.\n\nReplace it?"
+                    % os.path.basename(path)):
+                return
+        else:
+            path = filedialog.asksaveasfilename(
+                title="Save cleaned scan",
+                initialdir=folder,
+                initialfile="%s_dustfree%s" % (stem, ext),
+                defaultextension=ext,
+                filetypes=types,
+            )
+            if not path:
+                return
 
         self._saving = True
         self._set_controls_state("disabled")
@@ -3463,6 +3594,8 @@ class DustRemovalApp(tk.Tk):
             downgraded = path.lower().endswith((".jpg", ".jpeg"))
             bits = 16 if (self.image.dtype == np.uint16 and not downgraded) else 8
             self.status.config(text="Saved %d-bit to %s" % (bits, path))
+            self._saved_seq, self._saved_sig = self._edit_seq, self.render_sig
+            self._refresh_queue_state()
             if snapshot is not None:
                 self._export_labels(*snapshot)
         if self._close_when_done:
@@ -3760,6 +3893,7 @@ class DustRemovalApp(tk.Tk):
             self.render_btn.config(
                 state="disabled" if (self.image is None or self._saving
                                      or self._rendering or valid) else "normal")
+        self._refresh_queue_state()
 
     # -- navigator ----------------------------------------------------------
 
@@ -3945,6 +4079,10 @@ class DustRemovalApp(tk.Tk):
         """What each shortcut name actually does."""
         return {
             "open": self.open_image,
+            "open_folder": self.open_folder,
+            "queue_prev": lambda: self.queue_step(-1),
+            "queue_next": lambda: self.queue_step(1),
+            "queue_skip": lambda: self.queue_step(1, skip=True),
             "render": self.render_full,
             "save": self.save_image,
             "delete_mark": self.delete_mark,
@@ -4815,6 +4953,8 @@ def main():
     # the window is mapped before the navigator sizes itself.
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
         app.after(50, app.load_path, sys.argv[1])
+    elif len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        app.after(50, app._queue_folder, sys.argv[1])
 
     app.mainloop()
 
